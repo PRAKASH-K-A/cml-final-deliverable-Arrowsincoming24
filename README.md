@@ -1,202 +1,216 @@
 # Capital Markets Lab Final Deliverable
 
-This repository contains the final project submission under [cml_project](cml_project).
+This repository contains the final submission under [cml_project](cml_project).
 
-## Individual Contribution Report
+## Individual Contribution Dossier
 
 Author: Aarav Ashutosh Joshi  
-Module: G1-M4 (Order Persistence and Database Integration)  
-Additional Role: Group 1 leadership and stress-suite stabilization support
+Primary Module: G1-M4 (Order Persistence and Database Integration)  
+Additional Role: Group 1 coordination lead and stress-suite stabilization support
 
-## Scope of My Contribution
+## Repository Layout
 
-My contribution focuses on making order lifecycle state durable, consistent, and testable from ingestion to terminal state. The work includes:
+1. Core project root: [cml_project](cml_project)
+2. Exchange backend (primary contribution area): [cml_project/exchange-back-end](cml_project/exchange-back-end)
+3. External regression suite: [cml_project/external-scenarios](cml_project/external-scenarios)
+4. Database schema: [cml_project/database](cml_project/database)
+5. Team documentation: [cml_project/README.md](cml_project/README.md)
 
-1. Persistence-first lifecycle design
-2. Entity and schema modeling for lifecycle-critical fields
-3. DAO abstraction and batch operations for throughput
-4. Guarded state transitions for cancel and replace
-5. Stress-scenario stabilization support (especially T33)
+## Executive Contribution Summary
 
-## Code Map of Contribution
+My work focused on ensuring the exchange order lifecycle is durable, mathematically consistent, and operationally testable from ingestion to terminal state. The core implementation outcome is a persistence-first lifecycle model in which accepted intent, matching outcomes, and cancel/replace transitions are all durably represented and queryable.
 
-### 1) Intake, Deduplication, and Early Persistence
+This contribution spans:
+
+1. Intake deduplication and early persistence
+2. Orchestrated pre-match and post-match writes
+3. Lifecycle-safe status transitions for cancel/replace
+4. Schema and indexing strategy for operational query patterns
+5. DAO abstraction with batch and bulk write support
+6. Stress scenario stabilization and full-suite regression discipline
+
+## Architecture Context for My Module
+
+In Group 1, the lifecycle path was split into protocol intake, orchestration, matching, persistence, and external controls. My module sat at the persistence boundary, but in practice it influenced all layers because every lifecycle guarantee had to be validated against durable state.
+
+Primary integration points:
+
+1. FIX entry: [cml_project/exchange-back-end/src/main/java/com/helesto/core/ExchangeApplication.java](cml_project/exchange-back-end/src/main/java/com/helesto/core/ExchangeApplication.java)
+2. Intake engine: [cml_project/exchange-back-end/src/main/java/com/helesto/service/QuickFixJOrderIntakeEngine.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/QuickFixJOrderIntakeEngine.java)
+3. Orchestrator: [cml_project/exchange-back-end/src/main/java/com/helesto/service/OrderFlowOrchestrator.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/OrderFlowOrchestrator.java)
+4. Lifecycle engine: [cml_project/exchange-back-end/src/main/java/com/helesto/service/FixOrderManagementEngine.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/FixOrderManagementEngine.java)
+5. DAO boundary: [cml_project/exchange-back-end/src/main/java/com/helesto/dao/OrderDao.java](cml_project/exchange-back-end/src/main/java/com/helesto/dao/OrderDao.java)
+
+## Detailed Technical Contribution
+
+### 1. Intake Deduplication and Durable Acceptance Record
 
 Primary file: [cml_project/exchange-back-end/src/main/java/com/helesto/service/QuickFixJOrderIntakeEngine.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/QuickFixJOrderIntakeEngine.java)
 
-Key behavior implemented and validated:
+What was implemented:
 
-1. Duplicate Client Order ID rejection before deeper processing
-2. Baseline state initialization for accepted orders
-3. Early persistence of NEW orders to establish durable lifecycle truth
+1. Duplicate detection by Client Order ID before deeper processing
+2. Validation and enrichment before acceptance
+3. Immediate baseline persistence of NEW orders
 
-Representative logic:
+Why it is critical:
 
-	if (orderDao.findByClOrdId(clOrdId) != null) {
-		telemetryService.recordFixMessageRejected();
-		telemetryService.recordOrderRejected();
-		return IntakeResult.rejected(clOrdId, "UNKNOWN", '1', 0, "Duplicate ClOrdID");
-	}
+1. Prevents duplicate active orders from replay and client retries
+2. Ensures accepted orders have durable records before matching
+3. Eliminates acceptance-without-persistence failure mode
 
-	orderValidationService.enrichOrder(order);
-	order.setStatus("NEW");
-	orderDao.persistOrder(order);
-
-Why this matters:
-
-1. Prevents duplicate active orders from replay or retry
-2. Ensures accepted intent is durably recorded before matching
-
-### 2) Lifecycle Orchestration and Persist-Update Sequencing
+### 2. Two-Step Persistence Sequencing Through Orchestration
 
 Primary file: [cml_project/exchange-back-end/src/main/java/com/helesto/service/OrderFlowOrchestrator.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/OrderFlowOrchestrator.java)
 
-Key behavior implemented and validated:
+What was implemented:
 
-1. Pre-match persistence in NEW state
-2. Post-match update with fill and pricing outcomes
-3. Cancel-state write path with explicit status transition
+1. Pre-match write with NEW state and baseline quantity fields
+2. Post-match update with fills, leaves, avg price, and status
+3. Explicit cancel-state write path
 
-Representative flow:
+Why it is critical:
 
-	order.setStatus("NEW");
-	order.setFilledQty(0L);
-	order.setLeavesQty(order.getQuantity());
-	order.setAvgPrice(0.0);
-	orderDao.persistOrder(order);
+1. Preserves accepted intent and execution outcome as separate lifecycle facts
+2. Improves crash recoverability and replay confidence
+3. Makes lifecycle transitions traceable in storage
 
-	order.setFilledQty((long) matchResult.filledQty);
-	order.setLeavesQty((long) matchResult.leavesQty);
-	order.setAvgPrice(matchResult.avgPrice);
-	orderDao.updateOrder(order);
-
-Why this matters:
-
-1. Preserves both accepted intent and execution outcome
-2. Improves recoverability and lifecycle traceability
-
-### 3) Matching Outcome Consistency and State Guards
+### 3. Matching Consistency and Guarded State Transition Logic
 
 Primary file: [cml_project/exchange-back-end/src/main/java/com/helesto/service/FixOrderManagementEngine.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/FixOrderManagementEngine.java)
 
-Key behavior implemented and validated:
+What was implemented:
 
-1. Fill, leaves, and average price updates tied to matching results
-2. Status transitions to FILLED or PARTIALLY_FILLED based on leaves
-3. Cancel and replace rejection for terminal states
+1. Fill and leaves updates tied directly to matching results
+2. Avg price updates from actual fill value accumulation
+3. Status transitions to FILLED or PARTIALLY_FILLED based on remaining quantity
+4. Guarded cancel/replace semantics to block invalid terminal-state mutation
 
-Representative logic:
+Why it is critical:
 
-	order.setFilledQty((long) result.filledQty);
-	order.setLeavesQty((long) result.leavesQty);
-	order.setAvgPrice(totalValue / result.filledQty);
+1. Maintains quantity and status coherence under partial and multi-fill conditions
+2. Reduces race-sensitive lifecycle corruption under load
+3. Enforces state-machine behavior over permissive CRUD edits
 
-	if (result.leavesQty == 0) {
-		order.setStatus("FILLED");
-	} else {
-		order.setStatus("PARTIALLY_FILLED");
-	}
-
-	orderDao.updateOrder(order);
-
-Why this matters:
-
-1. Keeps lifecycle fields mathematically coherent
-2. Prevents illegal status mutations under race-prone requests
-
-### 4) Persistence Model, Constraints, and Queryability
+### 4. Entity and Schema Model for Lifecycle Truth
 
 Primary files:
 
 1. [cml_project/exchange-back-end/src/main/java/com/helesto/model/OrderEntity.java](cml_project/exchange-back-end/src/main/java/com/helesto/model/OrderEntity.java)
 2. [cml_project/database/schema.sql](cml_project/database/schema.sql)
 
-Lifecycle-critical fields modeled as first-class persisted state:
+Key lifecycle fields carried as first-class data:
 
 1. status
 2. filled_qty
 3. leaves_qty
 4. avg_price
+5. cl_ord_id and order_ref_number for identity traceability
 
 Index strategy implemented:
 
-1. idx_orders_symbol
-2. idx_orders_status
-3. idx_orders_client_id
-4. idx_orders_created_at
+1. symbol
+2. status
+3. client_id
+4. created_at
 
-Why this matters:
+Why it is critical:
 
-1. Fast operational reads for status/client/symbol/time filters
-2. Better consistency between API views and durable state
+1. Supports operational filters used by APIs and validation scripts
+2. Improves read responsiveness in active-state and audit scenarios
+3. Makes durable state independently interpretable
 
-### 5) DAO Boundary and Batch Throughput Support
+### 5. DAO as Exclusive Persistence Boundary and Throughput Layer
 
 Primary file: [cml_project/exchange-back-end/src/main/java/com/helesto/dao/OrderDao.java](cml_project/exchange-back-end/src/main/java/com/helesto/dao/OrderDao.java)
 
-Core methods:
+What was implemented:
 
-1. persistOrder
-2. updateOrder
-3. findByClOrdId
-4. batchPersistOrders
-5. batchUpdateOrders
-6. bulkUpdateStatus
+1. Core insert/update/find access methods
+2. Batch persist with configurable chunking and default behavior
+3. Batch update and bulk status mutation helpers
+4. Retention-oriented bulk delete helper
 
-Why this matters:
+Why it is critical:
 
-1. Keeps domain services free from direct query logic
-2. Supports high-volume writes with chunked batch behavior
+1. Keeps domain logic separated from persistence mechanics
+2. Supports high-volume write behavior in stress runs
+3. Centralizes transactional write semantics in one layer
 
-### 6) REST Lifecycle and Operational Controls
+### 6. REST Path Cohesion with Lifecycle Core
 
 Primary file: [cml_project/exchange-back-end/src/main/java/com/helesto/rest/OrderManagementRest.java](cml_project/exchange-back-end/src/main/java/com/helesto/rest/OrderManagementRest.java)
 
-Relevant endpoints:
+What was implemented or aligned:
 
-1. Orchestrated batch submit
-2. Amend path
-3. Bulk cancel path
+1. Orchestrated order submit path
+2. Batch submit path with throughput and latency reporting
+3. Amend and bulk cancel lifecycle operations
 
-Why this matters:
+Why it is critical:
 
-1. Ensures HTTP-driven workflow reuses lifecycle-safe core logic
-2. Provides operational tools for stress and validation runs
+1. REST behavior reuses lifecycle-safe core services
+2. Provides external control and observability for validation runs
 
-## Test and Validation Contribution
+## Validation and Reliability Contribution
 
-### Unit-level signal
+### Unit Validation Coverage
 
 Primary file: [cml_project/exchange-back-end/src/test/java/com/helesto/service/FixOrderManagementEngineTest.java](cml_project/exchange-back-end/src/test/java/com/helesto/service/FixOrderManagementEngineTest.java)
 
-Validated paths include:
+Validated behaviors:
 
-1. Cancel on active order
-2. Replace semantics with leaves consistency
-3. Cancel rejection on filled order
+1. Cancel path updates active order state correctly
+2. Replace path preserves identity semantics with amended values
+3. Terminal-state cancel request is correctly rejected
 
-### Scenario-level stabilization
+### Integration and Stress Validation
 
 Primary files:
 
-1. [cml_project/external-scenarios/06_stress_test/T33_cancel_storm.txt](cml_project/external-scenarios/06_stress_test/T33_cancel_storm.txt)
-2. [cml_project/external-scenarios/results/T33_result.txt](cml_project/external-scenarios/results/T33_result.txt)
-3. [cml_project/external-scenarios/run_all.ps1](cml_project/external-scenarios/run_all.ps1)
+1. [cml_project/external-scenarios/run_all.ps1](cml_project/external-scenarios/run_all.ps1)
+2. [cml_project/external-scenarios/README.md](cml_project/external-scenarios/README.md)
+3. [cml_project/external-scenarios/06_stress_test/T33_cancel_storm.txt](cml_project/external-scenarios/06_stress_test/T33_cancel_storm.txt)
+4. [cml_project/external-scenarios/results/T33_result.txt](cml_project/external-scenarios/results/T33_result.txt)
 
-Contribution highlights:
+Stabilization work included:
 
-1. Stabilization support for cancel-storm behavior under rapid submit/cancel cycles
-2. Regression discipline with repeated full-suite execution before closure
-3. Alignment between scenario assertions and durable lifecycle outcomes
+1. Reinforcing lifecycle behavior under submit/cancel bursts
+2. Validating stress outcomes against durable state expectations
+3. Repeating full-suite runs before closure to reduce one-off pass risk
 
-## Leadership Contribution (Group 1)
+## Leadership and Cross-Team Delivery Contribution
 
-Beyond module ownership, I contributed as Group 1 lead by:
+In addition to module implementation, I contributed as Group 1 coordination lead with focus on integration correctness.
 
-1. Aligning interface contracts across FIX path, REST path, and persistence path
-2. Enforcing full-suite regression gating for integration changes
-3. Driving end-to-end closure, not only component-level completion
+Leadership contributions:
 
-## Summary
+1. Interface alignment across FIX ingestion, orchestration, engine, DAO, and REST paths
+2. Regression gate discipline requiring stable full-suite behavior before sign-off
+3. End-to-end ownership of lifecycle quality, not only component-level completion
 
-My G1-M4 work delivered a lifecycle-consistent persistence backbone for the exchange order service. The design ensures accepted intent, execution progress, and terminal outcomes remain durable and queryable. Combined with unit and scenario validation, this contribution improved correctness, recoverability, and stability of the final deliverable.
+## Evidence Matrix
+
+| Contribution Area | Main Evidence Files |
+|---|---|
+| Deduplication and acceptance persistence | [QuickFixJOrderIntakeEngine.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/QuickFixJOrderIntakeEngine.java) |
+| Pre-match and post-match write sequencing | [OrderFlowOrchestrator.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/OrderFlowOrchestrator.java) |
+| Fill consistency and state guards | [FixOrderManagementEngine.java](cml_project/exchange-back-end/src/main/java/com/helesto/service/FixOrderManagementEngine.java) |
+| Entity and schema lifecycle model | [OrderEntity.java](cml_project/exchange-back-end/src/main/java/com/helesto/model/OrderEntity.java), [schema.sql](cml_project/database/schema.sql) |
+| DAO and batch throughput behavior | [OrderDao.java](cml_project/exchange-back-end/src/main/java/com/helesto/dao/OrderDao.java) |
+| REST operational lifecycle controls | [OrderManagementRest.java](cml_project/exchange-back-end/src/main/java/com/helesto/rest/OrderManagementRest.java) |
+| Unit validation | [FixOrderManagementEngineTest.java](cml_project/exchange-back-end/src/test/java/com/helesto/service/FixOrderManagementEngineTest.java) |
+| Stress and suite validation | [run_all.ps1](cml_project/external-scenarios/run_all.ps1), [T33_cancel_storm.txt](cml_project/external-scenarios/06_stress_test/T33_cancel_storm.txt), [T33_result.txt](cml_project/external-scenarios/results/T33_result.txt) |
+
+## Reproducibility Notes
+
+To inspect contribution evidence quickly:
+
+1. Start with the code map sections above
+2. Open the Evidence Matrix links by area
+3. Verify stress result markers in T33 result file
+4. Verify runner summary logic in run_all script
+
+## Final Statement
+
+My G1-M4 contribution delivered a persistence-safe lifecycle backbone that improved correctness, traceability, and recovery behavior of the exchange order path. Combined with scenario-first validation and integration governance, this work helped move the project from feature-complete to reliably stable under repeated stress and regression runs.
